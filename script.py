@@ -45,6 +45,7 @@ class NotebookImageProcessor:
             'images': 0,
             'errors': 0
         }
+        self.processed_base64 = set()  # 이미 처리된 BASE64 문자열 추적
     
     def generate_hash_filename(self, base64_string):
         """BASE64 문자열의 해시값으로 파일명 생성"""
@@ -55,7 +56,6 @@ class NotebookImageProcessor:
         """모든 .ipynb 파일 찾기"""
         notebooks = []
         for root, dirs, files in os.walk(base_folder):
-            # .ipynb_checkpoints 폴더 제외
             dirs[:] = [d for d in dirs if d != '.ipynb_checkpoints']
             for file in files:
                 if file.endswith('.ipynb'):
@@ -65,66 +65,92 @@ class NotebookImageProcessor:
     def process_notebook(self, notebook_path):
         """노트북 파일의 BASE64 이미지를 찾아서 업로드 후 치환"""
         print(f"\n처리 중: {notebook_path}")
+        self.processed_base64.clear()  # 노트북마다 초기화
         
         try:
-            # 파일을 텍스트로 읽기
             with open(notebook_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # BASE64 패턴 찾기 (최소 100자 이상의 BASE64 문자열)
-            # 이미지 데이터는 보통 매우 길기 때문에 짧은 문자열은 제외
-            pattern = r'"([A-Za-z0-9+/]{100,}={0,2})"'
-            matches = re.findall(pattern, content)
-            
-            if not matches:
-                print("  - BASE64 이미지 없음")
-                return
-            
-            print(f"  발견된 BASE64 문자열: {len(matches)}개")
-            
-            # 중복 제거 (동일한 이미지가 여러 번 나올 수 있음)
-            unique_matches = list(set(matches))
-            print(f"  고유 이미지: {len(unique_matches)}개")
-            
+            original_content = content
             replaced_count = 0
             
-            for idx, base64_str in enumerate(unique_matches, 1):
-                # BASE64 문자열이 실제로 이미지인지 간단히 확인
-                # (너무 짧거나 패턴이 이상한 경우 스킵)
-                if len(base64_str) < 200:
-                    continue
-                
-                try:
-                    # 파일명 생성
-                    filename = self.generate_hash_filename(base64_str)
-                    github_path = f"{self.image_folder}/{filename}"
-                    
-                    print(f"  [{idx}/{len(unique_matches)}] 업로드 중: {filename}...", end=' ')
-                    
-                    # GitHub에 업로드
-                    url = self.uploader.upload_base64_image(base64_str, github_path)
-                    
-                    # 원본 문자열을 URL로 치환
-                    content = content.replace(f'"{base64_str}"', f'"{url}"')
-                    
-                    replaced_count += 1
-                    self.stats['images'] += 1
-                    
-                    print(f"✓")
-                    
-                    # Rate limit 방지
-                    time.sleep(0.5)
-                    
-                except Exception as e:
-                    print(f"✗ ({str(e)})")
-                    self.stats['errors'] += 1
+            # 1. data:image/png;base64, 형식 처리
+            pattern_data_uri = r'data:image/(png|jpeg|jpg);base64,([A-Za-z0-9+/]{200,}={0,2})'
+            data_uri_matches = re.findall(pattern_data_uri, content)
             
-            # 변경사항이 있으면 파일 저장
+            if data_uri_matches:
+                print(f"  발견된 data URI 이미지: {len(data_uri_matches)}개")
+                unique_data_uri = list(set(data_uri_matches))
+                
+                for idx, (img_type, base64_str) in enumerate(unique_data_uri, 1):
+                    if base64_str in self.processed_base64:
+                        continue
+                    
+                    try:
+                        filename = self.generate_hash_filename(base64_str)
+                        github_path = f"{self.image_folder}/{filename}"
+                        
+                        print(f"  [Data URI {idx}/{len(unique_data_uri)}] 업로드: {filename}...", end=' ')
+                        
+                        url = self.uploader.upload_base64_image(base64_str, github_path)
+                        
+                        # data:image/png;base64,xxx 전체를 URL로 치환
+                        old_data_uri = f'data:image/{img_type};base64,{base64_str}'
+                        content = content.replace(old_data_uri, url)
+                        
+                        self.processed_base64.add(base64_str)
+                        replaced_count += 1
+                        self.stats['images'] += 1
+                        
+                        print(f"✓")
+                        time.sleep(0.5)
+                        
+                    except Exception as e:
+                        print(f"✗ ({str(e)})")
+                        self.stats['errors'] += 1
+            
+            # 2. 순수 BASE64 문자열 처리 (따옴표로 둘러싸인)
+            pattern_pure_base64 = r'"([A-Za-z0-9+/]{200,}={0,2})"'
+            pure_matches = re.findall(pattern_pure_base64, content)
+            
+            if pure_matches:
+                # 이미 처리되지 않은 것만 필터링
+                unprocessed = [m for m in pure_matches if m not in self.processed_base64]
+                
+                if unprocessed:
+                    print(f"  발견된 순수 BASE64 문자열: {len(unprocessed)}개")
+                    unique_pure = list(set(unprocessed))
+                    
+                    for idx, base64_str in enumerate(unique_pure, 1):
+                        try:
+                            filename = self.generate_hash_filename(base64_str)
+                            github_path = f"{self.image_folder}/{filename}"
+                            
+                            print(f"  [순수 BASE64 {idx}/{len(unique_pure)}] 업로드: {filename}...", end=' ')
+                            
+                            url = self.uploader.upload_base64_image(base64_str, github_path)
+                            
+                            # "base64_string"을 "url"로 치환
+                            content = content.replace(f'"{base64_str}"', f'"{url}"')
+                            
+                            self.processed_base64.add(base64_str)
+                            replaced_count += 1
+                            self.stats['images'] += 1
+                            
+                            print(f"✓")
+                            time.sleep(0.5)
+                            
+                        except Exception as e:
+                            print(f"✗ ({str(e)})")
+                            self.stats['errors'] += 1
+            
             if replaced_count > 0:
                 with open(notebook_path, 'w', encoding='utf-8') as f:
                     f.write(content)
                 print(f"  ✓ 완료: {replaced_count}개 이미지 업로드 및 치환")
                 self.stats['notebooks'] += 1
+            else:
+                print("  - 처리할 이미지 없음")
             
         except Exception as e:
             print(f"  ✗ 에러: {str(e)}")
@@ -145,7 +171,6 @@ class NotebookImageProcessor:
         for notebook in notebooks:
             self.process_notebook(notebook)
         
-        # 최종 통계
         print(f"\n{'='*60}")
         print("처리 완료!")
         print(f"  처리된 노트북: {self.stats['notebooks']}개")
@@ -156,7 +181,6 @@ class NotebookImageProcessor:
 
 # 사용
 if __name__ == '__main__':
-    # GitHub 설정
     GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
     if not GITHUB_TOKEN:
         raise ValueError("GITHUB_TOKEN 환경변수가 설정되지 않았습니다. 'export GITHUB_TOKEN=your_token' 으로 설정해주세요.")
@@ -164,13 +188,11 @@ if __name__ == '__main__':
     REPO_OWNER = 'ssafy-jinhyeok'
     REPO_NAME = 'AI'
     
-    # 업로더 생성
     uploader = GitHubImageUploader(
         token=GITHUB_TOKEN,
         repo_owner=REPO_OWNER,
         repo_name=REPO_NAME
     )
     
-    # 프로세서 생성 및 실행
     processor = NotebookImageProcessor(uploader)
-    processor.process_all('.')  # 현재 폴더부터 시작
+    processor.process_all('.')
